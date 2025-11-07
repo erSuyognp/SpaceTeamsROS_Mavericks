@@ -47,6 +47,7 @@ class RoverController(Node):
 
     def timer_callback(self):
         """Alternate between forward and reverse motion."""
+        self.log_message("Hello")
         if self.forward:
             self.log_message("Moving forward")
             self.send_accelerator_command(0.5)
