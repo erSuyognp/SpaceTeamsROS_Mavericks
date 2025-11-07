@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
             'example_client = space_teams_python.example_client:main',
             'image_client = space_teams_python.image_client:main',
+            'qualification_client = space_teams_python.qualification_client:main',
         ],
     },
 )

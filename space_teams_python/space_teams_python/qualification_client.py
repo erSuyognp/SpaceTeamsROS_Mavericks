@@ -23,7 +23,7 @@ class RoverController(Node):
 
         # Set up a timer to alternate between forward and reverse
         self.forward = True
-        self.timer = self.create_timer(3.0, self.timer_callback)  # every 3 seconds
+        self.timer = self.create_timer(10.0, self.timer_callback)  # every 3 seconds
 
         self.get_logger().info("Minimal Rover Controller started.")
 
