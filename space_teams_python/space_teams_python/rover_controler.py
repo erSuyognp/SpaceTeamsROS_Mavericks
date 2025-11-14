@@ -7,6 +7,7 @@ from geometry_msgs.msg import Point, Quaternion
 import math
 import time
 from space_teams_python.transformations import *
+from std_msgs.msg import Float32MultiArray
 
 
 class RoverController(Node):
@@ -39,6 +40,10 @@ class RoverController(Node):
 
         self.create_subscription(Point, 'CoreSamplingComplete', self.core_sampling_complete_callback, 1)
 
+        self.create_subscription(Point, 'ImageTopic', self.image_callback, 10)
+
+        self.create_subscription(Float32MultiArray, 'ObstacleDetection', self.detect_obsstacles, 10)
+
         # Control state
         self.target_loc_localFrame = None
         self.tolerance = 5.0  # meters
@@ -55,6 +60,8 @@ class RoverController(Node):
         # Timer for control loop
         self.timer = self.create_timer(0.1, self.timer_callback)
         self.get_logger().info('Rover controller is ready.')
+
+        self.obstacle_detected = []
 
     def location_marsFrame_callback(self, msg):
         self.current_location_marsFrame = msg
@@ -76,6 +83,9 @@ class RoverController(Node):
     
     def core_sampling_complete_callback(self, msg):
         self.state = "Driving"
+    
+    def detect_obstacles(self, msg):
+        self.obstacle_detected = msg.data
 
     def log_message(self, message):
         request = String.Request()
@@ -224,10 +234,15 @@ class RoverController(Node):
                                                             current_rot_localFrame)
         
         # Steering
+     
         steer_command = remap_clamp(-0.25 * np.pi, 0.25 * np.pi, -1.0, 1.0, heading_error)
         if abs(heading_error) < db_heading:
             steer_command = 0.0
         steer_gain = 1.0
+        if self.obstacle_detected[0] == 1.0:
+            self.log_message("Obstacle detected! Adjusting steering to avoid.")
+            steer_command = self.obstacle_detected[1]  # Adjust steering to avoid obstacle
+
         actual_steer_command = -steer_gain * steer_command
         
         # Acceleration
@@ -257,6 +272,36 @@ class RoverController(Node):
         #     )
         self.navigation_iterations += 1
 
+
+        def generate_distance_matrix(self, waypoints)-> np.ndarray:
+            n = len(waypoints)
+            dist = np.full((n, n), np.inf)
+            for i in range(n):
+                for j in range(n):
+                    if i != j:
+                        dist[i][j] = np.linalg.norm(waypoints[i] - waypoints[j])
+            return dist
+
+        def optimal_path(self, cost_matrix: np.ndarray)-> np.array:
+            visted = cost_matrix.shape[0] * [False]
+            index=0
+            node_order = []
+            while not all(visted):
+                sorted_cost = np.sort(cost_matrix[index])
+                for d in sorted_cost:
+                        next_index = np.where(cost_matrix[index] == d)[0][0]
+                        if not visted[next_index]:
+                            node_order.append(next_index)
+                            visted[next_index] = True
+                            index = next_index
+                            break
+            return node_order
+        
+        def detect_obsstacles(self):
+            pass
+
+        def image_callback(self, msg):
+            pass
 
 def main(args=None):
     rclpy.init(args=args)
@@ -299,6 +344,11 @@ def main(args=None):
 
     current_x = rover_controller.current_location_localFrame.x
     current_y = rover_controller.current_location_localFrame.y
+
+    #sorting the waypoints to minimize travel distance
+    distance_matrix = rover_controller.generate_distance_matrix(waypoints_localFrame)
+    waypoint_order = rover_controller.optimal_path(distance_matrix)
+    waypoints_localFrame = [waypoints_localFrame[i] for i in waypoint_order]
 
     rover_controller.waypoints = waypoints_localFrame
     rover_controller.current_waypoint_idx = 0

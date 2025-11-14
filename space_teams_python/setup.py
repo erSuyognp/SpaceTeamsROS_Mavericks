@@ -24,8 +24,9 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'example_client = space_teams_python.example_client:main',
+            'rover_controler = space_teams_python.rover_controler:main',
             'image_client = space_teams_python.image_client:main',
+            'detection_client = space_teams_python.detection_client:main',
         ],
     },
 )
