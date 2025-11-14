@@ -4,14 +4,27 @@ import rclpy
 from rclpy.node import Node
 from space_teams_definitions.srv import String, Float
 from geometry_msgs.msg import Point, Quaternion
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
 import math
+import cv2
 import time
 from space_teams_python.transformations import *
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 
 class RoverController(Node):
     def __init__(self):
         super().__init__('RoverController')
+        self.bridge = CvBridge()
+
+        # Define a QoS profile suitable for sensors
+        qos_profile = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+
         # Service clients
         self.logger_client = self.create_client(String, 'log_message')
         self.steer_client = self.create_client(Float, 'Steer')
@@ -38,6 +51,9 @@ class RoverController(Node):
         self.create_subscription(Quaternion, 'RotationLocalFrame', self.rotation_localFrame_callback, 10)
 
         self.create_subscription(Point, 'CoreSamplingComplete', self.core_sampling_complete_callback, 1)
+
+        self.create_subscription(Image, '/camera/image_raw', self.image_callback, qos_profile)   
+        self.create_subscription(Image, '/camera/depth/image_raw', self.depth_callback, qos_profile)
 
         # Control state
         self.target_loc_localFrame = None
@@ -76,6 +92,39 @@ class RoverController(Node):
     
     def core_sampling_complete_callback(self, msg):
         self.state = "Driving"
+
+    def image_callback(self, msg):
+        try:
+            # Convert ROS Image message to OpenCV image
+            cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            # Process the image
+            self.process_image(cv_image)
+            cv2.imshow('Camera Feed', cv_image)
+            cv2.waitKey(1)
+        except Exception as e:
+            self.get_logger().error(f'Error processing image: {str(e)}')
+
+    def depth_callback(self, msg):
+        try:
+            # Convert to numpy array (depth map)
+            depth_image = self.bridge.imgmsg_to_cv2(msg)
+            
+            # You can access distance values directly from the image
+            # For example, to get the distance at the center:
+            height, width = depth_image.shape
+            center_distance = depth_image[height//2, width//2]
+            self.get_logger().info(f'Center distance: {center_distance} meters')
+            
+            # Visualize the depth map
+            # Note: Need to normalize for visualization
+            depth_colormap = cv2.applyColorMap(
+                cv2.convertScaleAbs(depth_image, alpha=0.03), 
+                cv2.COLORMAP_JET
+            )
+            cv2.imshow('Depth Camera', depth_colormap)
+            cv2.waitKey(1)
+        except Exception as e:
+            self.get_logger().error(f'Error processing depth image: {str(e)}')
 
     def log_message(self, message):
         request = String.Request()

@@ -103,15 +103,23 @@ class ImageSubscriber(Node):
         if tcp_ok:
             self.get_logger().info(f"TCP probe to {windows_ip}:55556 OK.")
         else:
-            self.get_logger().error(f"TCP probe to {windows_ip}:55556 failed (firewall/bind?).")
-            return
+            self.get_logger().warn(f"TCP probe to {windows_ip}:55556 failed (firewall/bind?).")
+            self.get_logger().warn("Will still attempt ZMQ connection - sometimes probe fails but connection works.")
+            self.get_logger().warn("Make sure Space Teams PRO is running and publishing camera images on port 55556.")
 
+        # Try to connect even if TCP probe failed (sometimes probe fails but ZMQ works)
         try:
             self._zmq_socket.connect(connect_address)
             self.get_logger().info(f"Successfully connected to {connect_address}")
             self.connected = True
         except Exception as e:
-            self.get_logger().error(f"Failed to connect: {e}")
+            self.get_logger().error(f"Failed to connect to {connect_address}: {e}")
+            self.get_logger().error("Troubleshooting:")
+            self.get_logger().error("  1. Is Space Teams PRO running?")
+            self.get_logger().error("  2. Is Space Teams PRO configured to publish camera images via ZMQ?")
+            self.get_logger().error("  3. Is it listening on port 55556?")
+            self.get_logger().error("  4. Check Windows Firewall - allow port 55556")
+            self.get_logger().error("  5. Try: netstat -an | grep 55556 (on Windows) to check if port is listening")
             return
 
 
