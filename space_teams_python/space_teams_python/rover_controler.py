@@ -40,9 +40,9 @@ class RoverController(Node):
 
         self.create_subscription(Point, 'CoreSamplingComplete', self.core_sampling_complete_callback, 1)
 
-        self.create_subscription(Point, 'ImageTopic', self.image_callback, 10)
+    
 
-        self.create_subscription(Float32MultiArray, 'ObstacleDetection', self.detect_obsstacles, 10)
+        self.create_subscription(Float32MultiArray, 'ObstacleDetection', self.detect_obstacles, 10)
 
         # Control state
         self.target_loc_localFrame = None
@@ -61,7 +61,7 @@ class RoverController(Node):
         self.timer = self.create_timer(0.1, self.timer_callback)
         self.get_logger().info('Rover controller is ready.')
 
-        self.obstacle_detected = []
+        self.obstacle_detected = [0.0, 0.0]  # [detected (0 or 1), steer adjustment]
 
     def location_marsFrame_callback(self, msg):
         self.current_location_marsFrame = msg
@@ -223,7 +223,7 @@ class RoverController(Node):
             return
         
         # Velocity error
-        speed_limit_kph = 15.0
+        speed_limit_kph = 20.0
         speed_diff_kph = self.calculate_speed_difference(current_vel_localFrame, speed_limit_kph)  # target - current
         accel_factor = remap_clamp(0.0, speed_limit_kph, 0.0, 1.0, speed_diff_kph)  # 1 if not moving, 0 if too fast
         brake_factor = 1.0 - remap_clamp(-speed_limit_kph, 0.0, 0.0, 1.0, speed_diff_kph)  # 0 if <= speed limit, 1 if 2x over
@@ -273,7 +273,7 @@ class RoverController(Node):
         self.navigation_iterations += 1
 
 
-        def generate_distance_matrix(self, waypoints)-> np.ndarray:
+    def generate_distance_matrix(self, waypoints)-> np.ndarray:
             n = len(waypoints)
             dist = np.full((n, n), np.inf)
             for i in range(n):
@@ -282,7 +282,7 @@ class RoverController(Node):
                         dist[i][j] = np.linalg.norm(waypoints[i] - waypoints[j])
             return dist
 
-        def optimal_path(self, cost_matrix: np.ndarray)-> np.array:
+    def optimal_path(self, cost_matrix: np.ndarray)-> np.array:
             visted = cost_matrix.shape[0] * [False]
             index=0
             node_order = []
@@ -297,10 +297,10 @@ class RoverController(Node):
                             break
             return node_order
         
-        def detect_obsstacles(self):
+    def detect_obsstacles(self):
             pass
 
-        def image_callback(self, msg):
+    def image_callback(self, msg):
             pass
 
 def main(args=None):

@@ -10,7 +10,7 @@ from std_msgs.msg import Float32MultiArray
 
 from dataclasses import dataclass
 import rclpy.qos
-
+import cv2
 from space_teams_python.utils import direction_manuver, detect_rock
 
 @dataclass
@@ -80,6 +80,14 @@ class detection(Node):
             file_path = os.path.join(self.save_directory, file_name)
 
             # Save the image
+            valid_rocks = detect_rock(cv_image)
+
+            if valid_rocks:
+                for valid_rock in valid_rocks:
+                    x, y, w, h = valid_rock['bbox']
+                    cv2.rectangle(cv_image, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            cv_image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
+            cv2.imshow("Detected Rocks", cv_image)
             obstacle_array = direction_manuver(detect_rock(cv_image))
             obstacle_msg = Float32MultiArray()
             obstacle_msg.data = obstacle_array
