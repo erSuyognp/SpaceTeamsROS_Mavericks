@@ -89,30 +89,34 @@ class RoverController(Node):
         self.depth_frame_count = 0
         self.last_rgb_time = None
         self.last_depth_time = None
+        
+        # Frame skipping for performance
+        self.yolo_process_every_n_frames = 10  # Process YOLO every 10nth frame
+        self.depth_process_every_n_frames = 10  # Process depth obstacle detection every 10nth frame
 
         # Obstacle detection parameters
         self.obstacle_detection_enabled = True
-        self.obstacle_threshold_distance = 200.0  # meters - obstacle if closer than this
-        self.obstacle_detection_region_height = 0.4  # Use bottom 40% of image for obstacle detection
+        self.obstacle_threshold_distance = 100.0  # meters - obstacle if closer than this
+        self.obstacle_detection_region_height = 0.3  # Use bottom 30% of image for obstacle detection
         self.obstacle_avoidance_active = False
         self.obstacle_clearance_time = None
         self.obstacle_clearance_duration = 2.0  # seconds to wait after obstacle cleared
-        self.avoidance_steer_direction = 0.0  # -1.0 (left) to 1.0 (right)
+        self.avoidance_steer_direction = 0.0  # -1.0 (left) to 1.0 (right) - proportional value
 
         # YOLO rock detection parameters
         self.yolo_enabled = YOLO_AVAILABLE
         self.yolo_model = None
         self.rock_detections = []  # List of detected rocks: [(x_center, y_center, width, height, confidence), ...]
         self.rock_detection_confidence_threshold = 0.5  # Minimum confidence for rock detection
-        self.rock_danger_zone_threshold = 0.4  # Rocks in bottom 40% of image are considered dangerous
-        self.yolo_model_path = 'yolov8n.pt'  # Default YOLOv8 nano model (smallest, fastest)
+        self.rock_danger_zone_threshold = 0.5  # Rocks in bottom 50% of image are considered dangerous
+        self.yolo_model_path = 'aug_best.pt'  # Default YOLOv8 nano model (smallest, fastest)
         
         # Initialize YOLO model if available
         if self.yolo_enabled:
             try:
                 self.yolo_model = YOLO(self.yolo_model_path)
                 self.get_logger().info(f"YOLO model loaded: {self.yolo_model_path}")
-                self.get_logger().info("Rock detection enabled. Looking for: person, bicycle, car, motorcycle, bus, truck (as rock proxies)")
+                self.get_logger().info("Rock detection enabled.")
             except Exception as e:
                 self.get_logger().error(f"Failed to load YOLO model: {e}")
                 self.yolo_enabled = False
@@ -204,14 +208,16 @@ class RoverController(Node):
             
             self.latest_rgb = cv_image
 
-            # Process the image (YOLO rock detection)
-            self.process_image(cv_image)
-
-            # Draw YOLO detections on image
+            # Process YOLO only every Nth frame to reduce lag
+            # Always display latest frame but use previous detection results
+            if self.rgb_frame_count % self.yolo_process_every_n_frames == 0:
+                # Process the image (YOLO rock detection)
+                self.process_image(cv_image)
+            # Always draw latest detections (from last YOLO processing) on current frame
             if self.yolo_enabled and self.rock_detections:
                 self.draw_rock_detections(cv_image)
 
-            # Display the camera feed
+            # Display the camera feed (always show latest frame for real-time feel)
             cv2.imshow('Camera Feed', cv_image)
             cv2.waitKey(1)
 
@@ -285,50 +291,78 @@ class RoverController(Node):
     def process_rock_obstacles(self, dangerous_rocks, image_width):
         """
         Process detected rocks in the danger zone and trigger obstacle avoidance.
+        Uses proportional steering based on rock position - only steers enough to avoid.
         """
         if not dangerous_rocks:
             return
         
-        # Divide image into left, center, right regions
-        region_width = image_width // 3
+        center_x = image_width // 2
         left_rocks = []
-        center_rocks = []
         right_rocks = []
         
         for rock in dangerous_rocks:
             x_center = rock['x_center']
-            if x_center < region_width:
+            if x_center < center_x:
                 left_rocks.append(rock)
-            elif x_center < 2 * region_width:
-                center_rocks.append(rock)
             else:
                 right_rocks.append(rock)
         
-        # Determine avoidance direction based on rock locations
-        if center_rocks or (left_rocks and right_rocks):
-            # Rocks in center or both sides - choose direction with fewer rocks
-            if len(left_rocks) < len(right_rocks):
-                self.avoidance_steer_direction = -1.0  # Steer left
+        # Calculate proportional steering based on rock positions
+        # Rocks closer to center need more steering, rocks further away need less
+        min_steer = 0.2  # Minimum steering to avoid
+        max_steer = 0.6  # Maximum steering (reduced from 0.8)
+        
+        if left_rocks and right_rocks:
+            # Rocks on both sides - calculate average position and steer away from center
+            left_avg_x = np.mean([r['x_center'] for r in left_rocks])
+            right_avg_x = np.mean([r['x_center'] for r in right_rocks])
+            
+            # Determine which side has rocks closer to center
+            left_dist_from_center = center_x - left_avg_x  # Distance from center to left rocks
+            right_dist_from_center = right_avg_x - center_x  # Distance from center to right rocks
+            
+            # Steer away from the side with rocks closer to center
+            if left_dist_from_center < right_dist_from_center:
+                # Left rocks closer to center, steer right
+                # Closer to center = more steering needed
+                steer_intensity = min_steer + (max_steer - min_steer) * (1.0 - left_dist_from_center / center_x)
+                self.avoidance_steer_direction = min(steer_intensity, max_steer)
             else:
-                self.avoidance_steer_direction = 1.0  # Steer right
+                # Right rocks closer to center, steer left
+                steer_intensity = min_steer + (max_steer - min_steer) * (1.0 - right_dist_from_center / center_x)
+                self.avoidance_steer_direction = -min(steer_intensity, max_steer)
+            
             self.obstacle_avoidance_active = True
             self.obstacle_clearance_time = None
-            if self.depth_frame_count % 10 == 0:  # Log periodically
-                self.get_logger().warn(f"YOLO: Rocks detected in danger zone! L:{len(left_rocks)} C:{len(center_rocks)} R:{len(right_rocks)}")
+            if self.depth_frame_count % 10 == 0:
+                self.get_logger().warn(f"YOLO: Rocks both sides! L:{len(left_rocks)} R:{len(right_rocks)} Steer:{self.avoidance_steer_direction:.2f}")
         elif left_rocks:
-            # Rocks on left - steer right
-            self.avoidance_steer_direction = 1.0
+            # Rocks on left - steer right proportionally
+            left_avg_x = np.mean([r['x_center'] for r in left_rocks])
+            dist_from_center = center_x - left_avg_x  # Distance from center
+            
+            # Calculate proportional steering: closer to center = more steering
+            # Normalize distance (0 at center, center_x at edge)
+            steer_intensity = min_steer + (max_steer - min_steer) * (1.0 - dist_from_center / center_x)
+            self.avoidance_steer_direction = min(steer_intensity, max_steer)
+            
             self.obstacle_avoidance_active = True
             self.obstacle_clearance_time = None
             if self.depth_frame_count % 10 == 0:
-                self.get_logger().warn(f"YOLO: {len(left_rocks)} rock(s) detected on LEFT - steering RIGHT")
+                self.get_logger().warn(f"YOLO: {len(left_rocks)} rock(s) on LEFT - steering RIGHT {self.avoidance_steer_direction:.2f}")
         elif right_rocks:
-            # Rocks on right - steer left
-            self.avoidance_steer_direction = -1.0
+            # Rocks on right - steer left proportionally
+            right_avg_x = np.mean([r['x_center'] for r in right_rocks])
+            dist_from_center = right_avg_x - center_x  # Distance from center
+            
+            # Calculate proportional steering: closer to center = more steering
+            steer_intensity = min_steer + (max_steer - min_steer) * (1.0 - dist_from_center / center_x)
+            self.avoidance_steer_direction = -min(steer_intensity, max_steer)
+            
             self.obstacle_avoidance_active = True
             self.obstacle_clearance_time = None
             if self.depth_frame_count % 10 == 0:
-                self.get_logger().warn(f"YOLO: {len(right_rocks)} rock(s) detected on RIGHT - steering LEFT")
+                self.get_logger().warn(f"YOLO: {len(right_rocks)} rock(s) on RIGHT - steering LEFT {self.avoidance_steer_direction:.2f}")
 
     def depth_callback(self, msg):
         try:
@@ -344,8 +378,8 @@ class RoverController(Node):
             depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
             self.latest_depth = depth_image
             
-            # Perform obstacle detection
-            if self.obstacle_detection_enabled:
+            # Perform obstacle detection only every Nth frame to reduce lag
+            if self.obstacle_detection_enabled and self.depth_frame_count % self.depth_process_every_n_frames == 0:
                 self.detect_obstacles(depth_image)
             
             # You can access distance values directly from the image
@@ -358,12 +392,13 @@ class RoverController(Node):
                 self.get_logger().info(f'Center distance: {center_distance:.2f} meters')
             
             # Visualize the depth map with obstacle regions
+            # Always update visualization with latest frame for real-time feel
             depth_colormap = cv2.applyColorMap(
                 cv2.convertScaleAbs(depth_image, alpha=0.03), 
                 cv2.COLORMAP_JET
             )
             
-            # Draw obstacle detection regions on visualization
+            # Draw obstacle detection regions on visualization (use last detection results)
             if self.obstacle_detection_enabled and depth_image is not None:
                 self.visualize_obstacle_regions(depth_colormap, depth_image)
             
@@ -390,7 +425,7 @@ class RoverController(Node):
     def detect_obstacles(self, depth_image):
         """
         Detect obstacles in the depth image by analyzing regions.
-        Divides the image into left, center, and right regions and checks for obstacles.
+        Divides the image into left and right regions and checks for obstacles.
         """
         if depth_image is None:
             return
@@ -401,11 +436,10 @@ class RoverController(Node):
         detection_start_row = int(height * (1.0 - self.obstacle_detection_region_height))
         detection_region = depth_image[detection_start_row:, :]
         
-        # Divide into three regions: left, center, right
-        region_width = width // 3
-        left_region = detection_region[:, :region_width]
-        center_region = detection_region[:, region_width:2*region_width]
-        right_region = detection_region[:, 2*region_width:]
+        # Divide into two regions: left and right (no center segment)
+        center_x = width // 2
+        left_region = detection_region[:, :center_x]
+        right_region = detection_region[:, center_x:]
         
         # Calculate median distance for each region (more robust than mean)
         def safe_median(region):
@@ -416,31 +450,29 @@ class RoverController(Node):
             return float('inf')
         
         left_distance = safe_median(left_region)
-        center_distance = safe_median(center_region)
         right_distance = safe_median(right_region)
         
         # Check for obstacles (distance < threshold)
         left_obstacle = left_distance < self.obstacle_threshold_distance
-        center_obstacle = center_distance < self.obstacle_threshold_distance
         right_obstacle = right_distance < self.obstacle_threshold_distance
         
         # Determine avoidance direction
-        if center_obstacle or (left_obstacle and right_obstacle):
-            # Obstacle in center or both sides - choose direction with more clearance
+        if left_obstacle and right_obstacle:
+            # Obstacles on both sides - choose direction with more clearance
             if left_distance > right_distance:
-                self.avoidance_steer_direction = -1.0  # Steer left
+                self.avoidance_steer_direction = -0.4  # Steer left
             else:
-                self.avoidance_steer_direction = 1.0  # Steer right
+                self.avoidance_steer_direction = 0.4  # Steer right
             self.obstacle_avoidance_active = True
             self.obstacle_clearance_time = None
         elif left_obstacle:
             # Obstacle on left - steer right
-            self.avoidance_steer_direction = 1.0
+            self.avoidance_steer_direction = 0.4
             self.obstacle_avoidance_active = True
             self.obstacle_clearance_time = None
         elif right_obstacle:
             # Obstacle on right - steer left
-            self.avoidance_steer_direction = -1.0
+            self.avoidance_steer_direction = -0.4
             self.obstacle_avoidance_active = True
             self.obstacle_clearance_time = None
         else:
@@ -459,7 +491,7 @@ class RoverController(Node):
         # Log obstacle status periodically
         if self.depth_frame_count % 30 == 0 and self.obstacle_avoidance_active:
             self.get_logger().warn(
-                f"Obstacle detected! L:{left_distance:.1f}m C:{center_distance:.1f}m R:{right_distance:.1f}m "
+                f"Obstacle detected! L:{left_distance:.1f}m R:{right_distance:.1f}m "
                 f"Steering: {'LEFT' if self.avoidance_steer_direction < 0 else 'RIGHT'}"
             )
 
@@ -518,19 +550,16 @@ class RoverController(Node):
         
         height, width = depth_image.shape
         detection_start_row = int(height * (1.0 - self.obstacle_detection_region_height))
-        region_width = width // 3
+        center_x = width // 2
         
-        # Draw region boundaries
-        cv2.line(depth_colormap, (region_width, detection_start_row), (region_width, height), (255, 255, 255), 2)
-        cv2.line(depth_colormap, (2*region_width, detection_start_row), (2*region_width, height), (255, 255, 255), 2)
+        # Draw single vertical line dividing left and right regions (no center segment)
+        cv2.line(depth_colormap, (center_x, detection_start_row), (center_x, height), (255, 255, 255), 2)
         cv2.line(depth_colormap, (0, detection_start_row), (width, detection_start_row), (255, 255, 255), 2)
         
-        # Draw labels
-        cv2.putText(depth_colormap, 'L', (region_width//2, height-10), 
+        # Draw labels for left and right only (no center)
+        cv2.putText(depth_colormap, 'L', (width//4, height-10), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.putText(depth_colormap, 'C', (region_width + region_width//2, height-10), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.putText(depth_colormap, 'R', (2*region_width + region_width//2, height-10), 
+        cv2.putText(depth_colormap, 'R', (3*width//4, height-10), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         
         # Highlight if obstacle avoidance is active
@@ -755,19 +784,21 @@ class RoverController(Node):
             return
         
         # Velocity error
-        speed_limit_kph = 15.0
+        speed_limit_kph = 20.0
         speed_diff_kph = self.calculate_speed_difference(current_vel_localFrame, speed_limit_kph)  # target - current
         accel_factor = remap_clamp(0.0, speed_limit_kph, 0.0, 1.0, speed_diff_kph)  # 1 if not moving, 0 if too fast
         brake_factor = 1.0 - remap_clamp(-speed_limit_kph, 0.0, 0.0, 1.0, speed_diff_kph)  # 0 if <= speed limit, 1 if 2x over
 
         # Obstacle avoidance takes priority over normal navigation
         if self.obstacle_avoidance_active:
-            # Obstacle avoidance mode - steer away from obstacle
-            avoidance_steer_gain = 0.8  # Strong steering to avoid obstacles
-            actual_steer_command = avoidance_steer_gain * self.avoidance_steer_direction
+            # Obstacle avoidance mode - use proportional steering (already calculated based on rock position)
+            # avoidance_steer_direction is already proportional (-0.6 to 0.6), use it directly
+            actual_steer_command = self.avoidance_steer_direction
             
             # Reduce speed when avoiding obstacles
-            accel_command = 0.3  # Slow down during avoidance
+            # Acceleration
+            accel_gain = 2.0
+            accel_command = accel_gain * remap_clamp(0.0, 1.0, accel_factor, accel_factor * 0.5, abs(actual_steer_command))
             brake_command = 0.0
             
             self.send_steer_command(actual_steer_command)
@@ -777,7 +808,7 @@ class RoverController(Node):
             
             # Log avoidance action periodically
             if self.navigation_iterations % 10 == 0:
-                self.log_message(f"Obstacle avoidance: steering {'LEFT' if actual_steer_command < 0 else 'RIGHT'}")
+                self.log_message(f"Obstacle avoidance: steering {'LEFT' if actual_steer_command < 0 else 'RIGHT'} ({actual_steer_command:.2f})")
             
             self.navigation_iterations += 1
             return
