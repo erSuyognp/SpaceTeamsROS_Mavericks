@@ -96,12 +96,39 @@ class RoverController(Node):
 
         # Obstacle detection parameters
         self.obstacle_detection_enabled = True
-        self.obstacle_threshold_distance = 100.0  # meters - obstacle if closer than this
+        self.obstacle_threshold_distance = 1000.0  # meters - obstacle if closer than this (legacy)
         self.obstacle_detection_region_height = 0.3  # Use bottom 30% of image for obstacle detection
         self.obstacle_avoidance_active = False
         self.obstacle_clearance_time = None
         self.obstacle_clearance_duration = 2.0  # seconds to wait after obstacle cleared
         self.avoidance_steer_direction = 0.0  # -1.0 (left) to 1.0 (right) - proportional value
+        
+        # Enhanced depth processing parameters
+        self.stopping_distance = 2.5  # meters - distance threshold for stopping
+        self.emergency_distance = 1.0  # meters - emergency stop distance
+        self.slow_distance = 1.5  # meters - distance threshold for slowing down
+        self.max_range = 100.0  # meters - maximum valid depth range
+        self.use_bilateral_filter = True  # Use bilateral filter (preserves edges) vs median filter
+        self.bilateral_d = 5  # Bilateral filter diameter
+        self.bilateral_sigma_color = 50.0  # Bilateral filter sigma for color space
+        self.bilateral_sigma_space = 50.0  # Bilateral filter sigma for coordinate space
+        self.median_kernel_size = 5  # Median filter kernel size
+        self.morphology_kernel_size = 5  # Morphological operations kernel size
+        self.min_blob_area = 50  # Minimum blob area in pixels to consider as obstacle
+        self.roi_lower_fraction = 0.4  # Use lower 40% of image (near robot)
+        self.roi_center_band_fraction = 0.2  # Central horizontal band (20% of height)
+        self.ground_removal_enabled = False  # Enable ground plane removal (requires point cloud)
+        # Note: Ground plane removal would require:
+        # - Camera intrinsics (fx, fy, cx, cy) to convert depth -> XYZ point cloud
+        # - RANSAC for plane fitting to remove ground
+        # - DBSCAN for clustering after ground removal
+        # See detect_obstacles_with_ground_removal() method (not implemented) for future enhancement
+        self.steering_gain = 0.5  # Proportional gain for steering based on lateral offset
+        
+        # Visualization data
+        self.last_obstacle_mask = None
+        self.last_obstacle_blobs = []
+        self.emergency_stop_active = False
 
         # YOLO rock detection parameters
         self.yolo_enabled = YOLO_AVAILABLE
@@ -422,61 +449,195 @@ class RoverController(Node):
             # Example: Log combined information (can be removed or made less frequent)
             # self.get_logger().info(f'RGB+Depth center distance: {center_dist:.2f} m')
 
+    def preprocess_depth_image(self, depth_image):
+        """
+        Preprocess depth image: filter noise and clamp invalid values.
+        
+        Steps:
+        1. Apply median or bilateral filter to remove speckle/sensor noise
+        2. Clamp invalid values (0, NaN, > max_range) to inf or create ignore mask
+        """
+        if depth_image is None:
+            return None, None
+        
+        # Convert to float32 if needed
+        if depth_image.dtype != np.float32:
+            depth_image = depth_image.astype(np.float32)
+        
+        # Step 1: Apply noise reduction filter
+        if self.use_bilateral_filter:
+            # Bilateral filter preserves edges better than median
+            filtered = cv2.bilateralFilter(
+                depth_image, 
+                d=self.bilateral_d,
+                sigmaColor=self.bilateral_sigma_color,
+                sigmaSpace=self.bilateral_sigma_space
+            )
+        else:
+            # Median filter for speckle noise removal
+            filtered = cv2.medianBlur(depth_image, self.median_kernel_size)
+        
+        # Step 2: Clamp invalid values
+        # Create mask for valid values: > 0, < max_range, and finite
+        valid_mask = (filtered > 0.0) & (filtered < self.max_range) & np.isfinite(filtered)
+        
+        # Set invalid values to inf (or NaN for ignore)
+        processed = filtered.copy()
+        processed[~valid_mask] = np.inf
+        
+        return processed, valid_mask
+    
+    def create_roi_mask(self, height, width):
+        """
+        Create Region of Interest mask: lower part + central horizontal band.
+        
+        Returns:
+            roi_mask: Binary mask (True = ROI, False = ignore)
+        """
+        roi_mask = np.zeros((height, width), dtype=bool)
+        
+        # Lower part of image (near robot)
+        lower_start = int(height * (1.0 - self.roi_lower_fraction))
+        roi_mask[lower_start:, :] = True
+        
+        # Central horizontal band
+        center_band_start = int(height * (0.5 - self.roi_center_band_fraction / 2))
+        center_band_end = int(height * (0.5 + self.roi_center_band_fraction / 2))
+        roi_mask[center_band_start:center_band_end, :] = True
+        
+        return roi_mask
+    
     def detect_obstacles(self, depth_image):
         """
-        Detect obstacles in the depth image by analyzing regions.
-        Divides the image into left and right regions and checks for obstacles.
+        Enhanced obstacle detection using depth preprocessing, thresholding, 
+        morphological operations, and connected components analysis.
         """
         if depth_image is None:
             return
         
         height, width = depth_image.shape
+        image_center_x = width // 2
         
-        # Use bottom portion of image for obstacle detection (closer to ground)
-        detection_start_row = int(height * (1.0 - self.obstacle_detection_region_height))
-        detection_region = depth_image[detection_start_row:, :]
+        # Step 1: Preprocess depth image
+        processed_depth, valid_mask = self.preprocess_depth_image(depth_image)
+        if processed_depth is None:
+            return
         
-        # Divide into two regions: left and right (no center segment)
-        center_x = width // 2
-        left_region = detection_region[:, :center_x]
-        right_region = detection_region[:, center_x:]
+        # Step 2: Create ROI mask
+        roi_mask = self.create_roi_mask(height, width)
         
-        # Calculate median distance for each region (more robust than mean)
-        def safe_median(region):
-            # Filter out invalid values (NaN, Inf, zero)
-            valid_values = region[(region > 0.1) & (region < 100.0) & np.isfinite(region)]
-            if len(valid_values) > 0:
-                return np.median(valid_values)
-            return float('inf')
+        # Step 3: Depth thresholding - create binary mask where depth < stopping_distance
+        obstacle_mask = (processed_depth < self.stopping_distance) & valid_mask & roi_mask
         
-        left_distance = safe_median(left_region)
-        right_distance = safe_median(right_region)
+        # Step 4: Morphological clean-up
+        kernel = np.ones((self.morphology_kernel_size, self.morphology_kernel_size), np.uint8)
+        # Close holes (dilate then erode)
+        obstacle_mask = cv2.morphologyEx(obstacle_mask.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
+        # Remove small specks (opening: erode then dilate)
+        obstacle_mask = cv2.morphologyEx(obstacle_mask, cv2.MORPH_OPEN, kernel)
+        obstacle_mask = obstacle_mask.astype(bool)
         
-        # Check for obstacles (distance < threshold)
-        left_obstacle = left_distance < self.obstacle_threshold_distance
-        right_obstacle = right_distance < self.obstacle_threshold_distance
+        # Step 5: Connected components / clustering
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            obstacle_mask.astype(np.uint8), connectivity=8
+        )
         
-        # Determine avoidance direction
-        if left_obstacle and right_obstacle:
-            # Obstacles on both sides - choose direction with more clearance
-            if left_distance > right_distance:
-                self.avoidance_steer_direction = -0.4  # Steer left
+        # Find blobs and compute their properties
+        obstacle_blobs = []
+        min_depth_overall = float('inf')
+        
+        for i in range(1, num_labels):  # Skip label 0 (background)
+            area = stats[i, cv2.CC_STAT_AREA]
+            if area < self.min_blob_area:
+                continue  # Ignore small blobs
+            
+            # Get blob centroid
+            centroid_x = int(centroids[i, 0])
+            centroid_y = int(centroids[i, 1])
+            
+            # Compute nearest depth in this blob
+            blob_mask = (labels == i)
+            blob_depths = processed_depth[blob_mask & valid_mask]
+            
+            if len(blob_depths) > 0:
+                min_depth = np.min(blob_depths)
+                min_depth_overall = min(min_depth_overall, min_depth)
+                
+                obstacle_blobs.append({
+                    'centroid_x': centroid_x,
+                    'centroid_y': centroid_y,
+                    'area': area,
+                    'min_depth': min_depth,
+                    'label': i
+                })
+        
+        # Step 6: Decide action
+        if min_depth_overall < self.emergency_distance:
+            # EMERGENCY STOP
+            self.obstacle_avoidance_active = True
+            self.emergency_stop_active = True
+            self.avoidance_steer_direction = 0.0  # No steering, just stop
+            self.obstacle_clearance_time = None
+            
+            if self.depth_frame_count % 10 == 0:
+                self.get_logger().error(
+                    f"EMERGENCY STOP! Obstacle at {min_depth_overall:.2f}m < {self.emergency_distance}m"
+                )
+                self.log_message(f"EMERGENCY STOP: Obstacle detected at {min_depth_overall:.2f}m")
+        
+        elif obstacle_blobs:
+            self.emergency_stop_active = False
+            # Check if obstacles are in center ROI and closer than slow_distance
+            center_roi_start = int(width * 0.3)
+            center_roi_end = int(width * 0.7)
+            
+            center_obstacles = [
+                blob for blob in obstacle_blobs
+                if (blob['centroid_x'] >= center_roi_start and 
+                    blob['centroid_x'] <= center_roi_end and
+                    blob['min_depth'] < self.slow_distance)
+            ]
+            
+            if center_obstacles:
+                # Obstacle in center path - slow down and steer away
+                # Compute lateral offset: centroid x - image_center
+                # Average lateral offset of center obstacles
+                avg_lateral_offset = np.mean([
+                    blob['centroid_x'] - image_center_x 
+                    for blob in center_obstacles
+                ])
+                
+                # Map lateral offset to steering command (proportional)
+                # Normalize offset to [-1, 1] range (assuming max offset is width/2)
+                normalized_offset = avg_lateral_offset / (width / 2)
+                normalized_offset = np.clip(normalized_offset, -1.0, 1.0)
+                
+                # Steering: negative offset (left of center) -> steer right (positive)
+                #           positive offset (right of center) -> steer left (negative)
+                self.avoidance_steer_direction = -self.steering_gain * normalized_offset
+                self.obstacle_avoidance_active = True
+                self.obstacle_clearance_time = None
+                
+                if self.depth_frame_count % 10 == 0:
+                    self.get_logger().warn(
+                        f"Obstacle in center path! Depth: {min([b['min_depth'] for b in center_obstacles]):.2f}m, "
+                        f"Lateral offset: {avg_lateral_offset:.1f}px, Steering: {self.avoidance_steer_direction:.2f}"
+                    )
             else:
-                self.avoidance_steer_direction = 0.4  # Steer right
-            self.obstacle_avoidance_active = True
-            self.obstacle_clearance_time = None
-        elif left_obstacle:
-            # Obstacle on left - steer right
-            self.avoidance_steer_direction = 0.4
-            self.obstacle_avoidance_active = True
-            self.obstacle_clearance_time = None
-        elif right_obstacle:
-            # Obstacle on right - steer left
-            self.avoidance_steer_direction = -0.4
-            self.obstacle_avoidance_active = True
-            self.obstacle_clearance_time = None
+                # Obstacles present but not blocking center path
+                # Could still slow down but don't need aggressive steering
+                if self.obstacle_avoidance_active:
+                    # Start clearance timer
+                    if self.obstacle_clearance_time is None:
+                        self.obstacle_clearance_time = time.time()
+                    elif time.time() - self.obstacle_clearance_time > self.obstacle_clearance_duration:
+                        self.obstacle_avoidance_active = False
+                        self.obstacle_clearance_time = None
+                        self.avoidance_steer_direction = 0.0
+                        self.get_logger().info("Obstacle cleared, resuming normal navigation")
         else:
             # No obstacles detected
+            self.emergency_stop_active = False
             if self.obstacle_avoidance_active:
                 # Start clearance timer
                 if self.obstacle_clearance_time is None:
@@ -488,12 +649,9 @@ class RoverController(Node):
                     self.avoidance_steer_direction = 0.0
                     self.get_logger().info("Obstacle cleared, resuming normal navigation")
         
-        # Log obstacle status periodically
-        if self.depth_frame_count % 30 == 0 and self.obstacle_avoidance_active:
-            self.get_logger().warn(
-                f"Obstacle detected! L:{left_distance:.1f}m R:{right_distance:.1f}m "
-                f"Steering: {'LEFT' if self.avoidance_steer_direction < 0 else 'RIGHT'}"
-            )
+        # Store processed data for visualization
+        self.last_obstacle_mask = obstacle_mask
+        self.last_obstacle_blobs = obstacle_blobs
 
     def draw_rock_detections(self, cv_image):
         """
@@ -543,32 +701,98 @@ class RoverController(Node):
 
     def visualize_obstacle_regions(self, depth_colormap, depth_image):
         """
-        Draw obstacle detection regions on the depth visualization.
+        Enhanced visualization showing ROI, obstacle blobs, and processing results.
         """
         if depth_image is None:
             return
         
         height, width = depth_image.shape
-        detection_start_row = int(height * (1.0 - self.obstacle_detection_region_height))
-        center_x = width // 2
+        image_center_x = width // 2
         
-        # Draw single vertical line dividing left and right regions (no center segment)
-        cv2.line(depth_colormap, (center_x, detection_start_row), (center_x, height), (255, 255, 255), 2)
-        cv2.line(depth_colormap, (0, detection_start_row), (width, detection_start_row), (255, 255, 255), 2)
+        # Draw ROI regions
+        # Lower ROI
+        lower_start = int(height * (1.0 - self.roi_lower_fraction))
+        cv2.line(depth_colormap, (0, lower_start), (width, lower_start), (0, 255, 255), 2)
+        cv2.putText(depth_colormap, 'LOWER ROI', (10, lower_start - 10), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
         
-        # Draw labels for left and right only (no center)
-        cv2.putText(depth_colormap, 'L', (width//4, height-10), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.putText(depth_colormap, 'R', (3*width//4, height-10), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        # Central horizontal band
+        center_band_start = int(height * (0.5 - self.roi_center_band_fraction / 2))
+        center_band_end = int(height * (0.5 + self.roi_center_band_fraction / 2))
+        cv2.line(depth_colormap, (0, center_band_start), (width, center_band_start), (255, 255, 0), 2)
+        cv2.line(depth_colormap, (0, center_band_end), (width, center_band_end), (255, 255, 0), 2)
+        cv2.putText(depth_colormap, 'CENTER BAND ROI', (10, center_band_start - 10), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+        
+        # Draw center line
+        cv2.line(depth_colormap, (image_center_x, 0), (image_center_x, height), (255, 255, 255), 1)
+        
+        # Draw center ROI boundaries (30% to 70% of width)
+        center_roi_start = int(width * 0.3)
+        center_roi_end = int(width * 0.7)
+        cv2.line(depth_colormap, (center_roi_start, 0), (center_roi_start, height), (0, 255, 0), 1)
+        cv2.line(depth_colormap, (center_roi_end, 0), (center_roi_end, height), (0, 255, 0), 1)
+        
+        # Draw obstacle mask overlay if available
+        if self.last_obstacle_mask is not None:
+            # Create colored overlay for obstacles
+            obstacle_overlay = np.zeros_like(depth_colormap)
+            obstacle_overlay[self.last_obstacle_mask] = [0, 0, 255]  # Red for obstacles
+            # Blend overlay with colormap (modify in place)
+            blended = cv2.addWeighted(depth_colormap, 0.7, obstacle_overlay, 0.3, 0)
+            depth_colormap[:] = blended  # Copy result back to original array
+        
+        # Draw detected obstacle blobs
+        if self.last_obstacle_blobs:
+            for blob in self.last_obstacle_blobs:
+                cx = blob['centroid_x']
+                cy = blob['centroid_y']
+                depth = blob['min_depth']
+                area = blob['area']
+                
+                # Color based on distance
+                if depth < self.emergency_distance:
+                    color = (0, 0, 255)  # Red - emergency
+                elif depth < self.slow_distance:
+                    color = (0, 165, 255)  # Orange - slow down
+                else:
+                    color = (0, 255, 255)  # Yellow - caution
+                
+                # Draw centroid
+                cv2.circle(depth_colormap, (cx, cy), 5, color, -1)
+                cv2.circle(depth_colormap, (cx, cy), 10, color, 2)
+                
+                # Draw label
+                label = f"{depth:.2f}m"
+                cv2.putText(depth_colormap, label, (cx + 15, cy), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+        
+        # Draw distance thresholds
+        cv2.putText(depth_colormap, f'Stop: {self.stopping_distance}m', (width - 200, 20), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(depth_colormap, f'Slow: {self.slow_distance}m', (width - 200, 40), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(depth_colormap, f'Emergency: {self.emergency_distance}m', (width - 200, 60), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
         # Highlight if obstacle avoidance is active
-        if self.obstacle_avoidance_active:
+        if self.emergency_stop_active:
             overlay = depth_colormap.copy()
-            cv2.rectangle(overlay, (0, 0), (width, height), (0, 0, 255), 10)  # Red border
-            cv2.addWeighted(overlay, 0.3, depth_colormap, 0.7, 0, depth_colormap)
-            cv2.putText(depth_colormap, 'OBSTACLE AVOIDANCE ACTIVE', (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            cv2.rectangle(overlay, (0, 0), (width, height), (0, 0, 255), 15)  # Thick red border
+            blended = cv2.addWeighted(overlay, 0.4, depth_colormap, 0.6, 0)
+            depth_colormap[:] = blended  # Copy result back
+            cv2.putText(depth_colormap, 'EMERGENCY STOP!', (width//2 - 150, height//2), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+        elif self.obstacle_avoidance_active:
+            overlay = depth_colormap.copy()
+            cv2.rectangle(overlay, (0, 0), (width, height), (0, 165, 255), 10)  # Orange border
+            blended = cv2.addWeighted(overlay, 0.3, depth_colormap, 0.7, 0)
+            depth_colormap[:] = blended  # Copy result back
+            steer_text = f"Steering: {self.avoidance_steer_direction:.2f}"
+            cv2.putText(depth_colormap, 'OBSTACLE AVOIDANCE', (10, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+            cv2.putText(depth_colormap, steer_text, (10, 60), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
 
     def log_message(self, message):
         request = String.Request()
@@ -784,11 +1008,25 @@ class RoverController(Node):
             return
         
         # Velocity error
-        speed_limit_kph = 20.0
+        speed_limit_kph = 15.0
         speed_diff_kph = self.calculate_speed_difference(current_vel_localFrame, speed_limit_kph)  # target - current
         accel_factor = remap_clamp(0.0, speed_limit_kph, 0.0, 1.0, speed_diff_kph)  # 1 if not moving, 0 if too fast
         brake_factor = 1.0 - remap_clamp(-speed_limit_kph, 0.0, 0.0, 1.0, speed_diff_kph)  # 0 if <= speed limit, 1 if 2x over
 
+        # Emergency stop has highest priority
+        if self.emergency_stop_active:
+            # EMERGENCY STOP - brake immediately
+            self.send_brake_command(1.0)
+            self.send_accelerator_command(0.0)
+            self.send_reverse_command(0.0)
+            self.send_steer_command(0.0)
+            
+            if self.navigation_iterations % 10 == 0:
+                self.log_message("EMERGENCY STOP ACTIVE - Braking!")
+            
+            self.navigation_iterations += 1
+            return
+        
         # Obstacle avoidance takes priority over normal navigation
         if self.obstacle_avoidance_active:
             # Obstacle avoidance mode - use proportional steering (already calculated based on rock position)
