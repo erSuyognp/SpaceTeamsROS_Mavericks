@@ -8,6 +8,7 @@ from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 import math
 import cv2
+import torch
 import time
 import numpy as np
 from space_teams_python.transformations import *
@@ -91,7 +92,7 @@ class RoverController(Node):
         self.last_depth_time = None
         
         # Frame skipping for performance
-        self.yolo_process_every_n_frames = 10  # Process YOLO every 10nth frame
+        self.yolo_process_every_n_frames = 5  # Process YOLO every 10nth frame
         self.depth_process_every_n_frames = 10  # Process depth obstacle detection every 10nth frame
 
         # Obstacle detection parameters
@@ -142,11 +143,20 @@ class RoverController(Node):
         if self.yolo_enabled:
             try:
                 self.yolo_model = YOLO(self.yolo_model_path)
+
+                # ⭐ Force model to GPU if available
+                if torch.cuda.is_available():
+                    self.yolo_model.to('cuda')
+                    self.get_logger().info("YOLO using GPU (CUDA).")
+                else:
+                    self.get_logger().warn("CUDA not available, YOLO running on CPU.")
+
                 self.get_logger().info(f"YOLO model loaded: {self.yolo_model_path}")
                 self.get_logger().info("Rock detection enabled.")
             except Exception as e:
                 self.get_logger().error(f"Failed to load YOLO model: {e}")
                 self.yolo_enabled = False
+
         else:
             self.get_logger().warn("YOLO not available - rock detection disabled. Install with: pip install ultralytics")
 
