@@ -163,6 +163,11 @@ class RoverController(Node):
         self.unstuck_reverse_duration = 5.0  # seconds to reverse
         self.unstuck_turn_duration = 1.0  # seconds to turn left after reversing
 
+        # Automatic exposure adjustment parameters
+        self.TARGET_BRIGHTNESS = 100  # mid-brightness (0-255)
+        self.TOLERANCE = 10  # brightness tolerance
+        self.current_exposure = 13  # start from some reasonable value
+
         # Timer for control loop
         self.timer = self.create_timer(0.1, self.timer_callback)
         self.get_logger().info('Rover controller is ready.')
@@ -232,6 +237,26 @@ class RoverController(Node):
                 cv_image = cv2.cvtColor(cv_image, cv2.COLOR_RGB2BGR)
             else:
                 cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            
+            # Step 1: Measure the brightness of the image
+            gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
+            brightness = gray.mean()  # Value between about 0-255
+            
+            # Step 2 & 3: Adjust exposure slowly and safely based on brightness
+            if brightness < self.TARGET_BRIGHTNESS - self.TOLERANCE:
+                self.current_exposure -= 0.02  # brighten
+            elif brightness > self.TARGET_BRIGHTNESS + self.TOLERANCE:
+                self.current_exposure += 0.02  # darken
+            
+            # Clamp to safe range (your camera's range may differ)
+            self.current_exposure = max(5.0, min(20.0, self.current_exposure))
+            
+            # Send updated exposure to camera
+            self.change_exposure(self.current_exposure)
+            
+            # Print current exposure periodically (every 30 frames to reduce spam)
+            if self.rgb_frame_count % 30 == 0:
+                self.get_logger().info(f'Current exposure: {self.current_exposure:.3f}, Brightness: {brightness:.1f}')
             
             self.latest_rgb = cv_image
 
@@ -1134,12 +1159,12 @@ def main(args=None):
     current_x = rover_controller.current_location_localFrame.x
     current_y = rover_controller.current_location_localFrame.y
     
-    waypoint_order = [1, 17, 8, 4, 19, 3, 12, 6, 14, 9, 0, 2, 5, 13, 15, 11, 7, 16]
+    waypoint_order = [1, 17, 8, 18, 4, 19, 3, 10, 12, 6, 14, 9, 0, 2, 5, 13, 15, 11, 7, 16]
     waypoints_ordered = [waypoints_localFrame[i] for i in waypoint_order]
     rover_controller.waypoints = waypoints_ordered
     rover_controller.current_waypoint_idx = 0
 
-    rover_controller.log_message(
+    rover_controller.get_logger().info(
         f"Starting navigation: moving from ({current_x:.2f}, {current_y:.2f}) to ({waypoints_localFrame[0][0]:.2f}, {waypoints_localFrame[0][1]:.2f})"
     )
     
