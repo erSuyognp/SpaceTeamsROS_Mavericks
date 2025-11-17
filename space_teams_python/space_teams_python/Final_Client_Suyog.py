@@ -327,7 +327,7 @@ class RoverController(Node):
                             'height': box_height,
                             'confidence': confidence,
                             'class': class_name,
-                            'in_danger_zone': y_center > danger_zone_y
+                            'in_danger_zone': y_center >= danger_zone_y
                         })
             
             # Check if rocks detected in danger zone
@@ -434,28 +434,28 @@ class RoverController(Node):
             if self.obstacle_detection_enabled and self.depth_frame_count % self.depth_process_every_n_frames == 0:
                 self.detect_obstacles(depth_image)
             
-            # You can access distance values directly from the image
-            # For example, to get the distance at the center:
-            height, width = depth_image.shape
-            center_distance = float(depth_image[height//2, width//2])
+            # # You can access distance values directly from the image
+            # # For example, to get the distance at the center:
+            # height, width = depth_image.shape
+            # center_distance = float(depth_image[height//2, width//2])
             
-            # Log center distance periodically (every 30 frames to reduce spam)
-            if self.depth_frame_count % 30 == 0:
-                self.get_logger().info(f'Center distance: {center_distance:.2f} meters')
+            # # Log center distance periodically (every 30 frames to reduce spam)
+            # if self.depth_frame_count % 30 == 0:
+            #     self.get_logger().info(f'Center distance: {center_distance:.2f} meters')
             
-            # Visualize the depth map with obstacle regions
-            # Always update visualization with latest frame for real-time feel
-            depth_colormap = cv2.applyColorMap(
-                cv2.convertScaleAbs(depth_image, alpha=0.03), 
-                cv2.COLORMAP_JET
-            )
+            # # Visualize the depth map with obstacle regions
+            # # Always update visualization with latest frame for real-time feel
+            # depth_colormap = cv2.applyColorMap(
+            #     cv2.convertScaleAbs(depth_image, alpha=0.03), 
+            #     cv2.COLORMAP_JET
+            # )
             
-            # Draw obstacle detection regions on visualization (use last detection results)
-            if self.obstacle_detection_enabled and depth_image is not None:
-                self.visualize_obstacle_regions(depth_colormap, depth_image)
+            # # Draw obstacle detection regions on visualization (use last detection results)
+            # if self.obstacle_detection_enabled and depth_image is not None:
+            #     self.visualize_obstacle_regions(depth_colormap, depth_image)
             
-            cv2.imshow('Depth Camera', depth_colormap)
-            cv2.waitKey(1)
+            # cv2.imshow('Depth Camera', depth_colormap)
+            # cv2.waitKey(1)
         except Exception as e:
             self.get_logger().error(f'Error processing depth image: {str(e)}')
             import traceback
@@ -1015,6 +1015,7 @@ class RoverController(Node):
 
         # Distance to target
         distance = self.calculate_distance_to_target(current_loc_localFrame, self.target_loc_localFrame)
+        self.log_message(f"Distance to target: ({distance:.2f})")
         if distance < self.tolerance:
             self.send_brake_command(1.0)
             self.send_steer_command(0.0)
@@ -1159,12 +1160,12 @@ def main(args=None):
     current_x = rover_controller.current_location_localFrame.x
     current_y = rover_controller.current_location_localFrame.y
     
-    waypoint_order = [1, 17, 8, 18, 4, 19, 3, 10, 12, 6, 14, 9, 0, 2, 5, 13, 15, 11, 7, 16]
+    waypoint_order = [0, 1, 17, 8, 2, 5, 15, 13, 11, 7, 16, 18, 4, 19, 10, 3, 6, 12, 14, 9]
     waypoints_ordered = [waypoints_localFrame[i] for i in waypoint_order]
     rover_controller.waypoints = waypoints_ordered
     rover_controller.current_waypoint_idx = 0
 
-    rover_controller.get_logger().info(
+    rover_controller.log_message(
         f"Starting navigation: moving from ({current_x:.2f}, {current_y:.2f}) to ({waypoints_localFrame[0][0]:.2f}, {waypoints_localFrame[0][1]:.2f})"
     )
     
