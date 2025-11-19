@@ -80,6 +80,8 @@ class RoverController(Node):
         self.navigation_iterations = 0
         self.initial_move_end_time = None
         self.initial_move_done = False
+        self.last_speed_limit_kph = None
+
 
         # Waypoints
         self.waypoints = None
@@ -103,8 +105,10 @@ class RoverController(Node):
         self.obstacle_detection_region_height = 0.3  # Use bottom 30% of image for obstacle detection
         self.obstacle_avoidance_active = False
         self.obstacle_clearance_time = None
-        self.obstacle_clearance_duration = 2.0  # seconds to wait after obstacle cleared
+        self.obstacle_clearance_duration = 1.0  # seconds to wait after obstacle cleared
         self.avoidance_steer_direction = 0.0  # -1.0 (left) to 1.0 (right) - proportional value
+        self.last_rock_detection_time = None  # Timestamp of last rock detection
+        self.speed_reduction_duration = 2.0  # Keep speed at 15 for 2 seconds after rock detection
         
         # Enhanced depth processing parameters
         self.stopping_distance = 2.5  # meters - distance threshold for stopping
@@ -126,7 +130,7 @@ class RoverController(Node):
         # - RANSAC for plane fitting to remove ground
         # - DBSCAN for clustering after ground removal
         # See detect_obstacles_with_ground_removal() method (not implemented) for future enhancement
-        self.steering_gain = 0.5  # Proportional gain for steering based on lateral offset
+        self.steering_gain = 0.4  # Proportional gain for steering based on lateral offset
         
         # Visualization data
         self.last_obstacle_mask = None
@@ -341,6 +345,10 @@ class RoverController(Node):
                             'class': class_name,
                             'in_danger_zone': y_center >= danger_zone_y
                         })
+            
+            # Update timestamp when rocks are detected (for speed reduction delay)
+            if len(self.rock_detections) > 0:
+                self.last_rock_detection_time = time.time()
             
             # Check if rocks detected in danger zone
             dangerous_rocks = [r for r in self.rock_detections if r['in_danger_zone']]
@@ -1055,8 +1063,34 @@ class RoverController(Node):
                 self.log_message(f"After sampling, moving to next waypoint at: {next_loc}")
             return
         
-        # Velocity error
-        speed_limit_kph = 19.0
+        # Velocity error - Dynamic speed based on YOLO detection, exposure, and waypoint proximity
+        # Priority: exposure < 8 always uses speed 15, then waypoint proximity (except waypoints 12 & 19), then YOLO detection
+        # Compute speed limit
+        if self.current_exposure < 8.0 and self.current_waypoint_idx not in [19]:
+            # Low exposure (dark conditions) - always reduce speed for safety
+            speed_limit_kph = 15.0
+        elif distance < 70.0 and self.current_waypoint_idx not in [12, 19]:
+            # Close to waypoint (< 70m) - reduce speed for precision approach
+            # Exception: waypoints 12 and 19 allow speed 20 even when close
+            speed_limit_kph = 15.0
+        elif len(self.rock_detections) > 0:
+            # Rocks currently detected - reduce speed
+            speed_limit_kph = 15.0
+        elif (self.last_rock_detection_time is not None and 
+              time.time() - self.last_rock_detection_time < self.speed_reduction_duration):
+            # Rocks were detected within last 2 seconds - keep speed reduced
+            speed_limit_kph = 15.0
+        else:
+            # No rocks detected and 2+ seconds have passed - can drive faster
+            # Waypoints 12 and 19 also allow speed 20 when close
+            speed_limit_kph = 20.0
+
+        # Print/log only when speed changes
+        if speed_limit_kph != self.last_speed_limit_kph:
+            self.get_logger().warn(f"Speed changed to: {speed_limit_kph} kph")
+            self.last_speed_limit_kph = speed_limit_kph
+
+        
         speed_diff_kph = self.calculate_speed_difference(current_vel_localFrame, speed_limit_kph)  # target - current
         accel_factor = remap_clamp(0.0, speed_limit_kph, 0.0, 1.0, speed_diff_kph)  # 1 if not moving, 0 if too fast
         brake_factor = 1.0 - remap_clamp(-speed_limit_kph, 0.0, 0.0, 1.0, speed_diff_kph)  # 0 if <= speed limit, 1 if 2x over
