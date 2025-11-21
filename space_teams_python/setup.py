@@ -28,6 +28,7 @@ setup(
             'image_client = space_teams_python.image_client:main',
             'qualification_client = space_teams_python.qualification_client:main',
             'Final_Client = space_teams_python.Final_Client:main',
+            'Manual_Driving = space_teams_python.Manual_Driving:main',
         ],
     },
 )

@@ -105,7 +105,7 @@ class RoverController(Node):
         self.obstacle_detection_region_height = 0.3  # Use bottom 30% of image for obstacle detection
         self.obstacle_avoidance_active = False
         self.obstacle_clearance_time = None
-        self.obstacle_clearance_duration = 1.0  # seconds to wait after obstacle cleared
+        self.obstacle_clearance_duration = 0.0  # seconds to wait after obstacle cleared
         self.avoidance_steer_direction = 0.0  # -1.0 (left) to 1.0 (right) - proportional value
         self.last_rock_detection_time = None  # Timestamp of last rock detection
         self.speed_reduction_duration = 2.0  # Keep speed at 15 for 2 seconds after rock detection
@@ -168,7 +168,7 @@ class RoverController(Node):
 
         # Stuck detection parameters
         self.stuck_detection_enabled = True
-        self.stuck_threshold_distance = 1.0  # meters - considered stuck if moved less than this
+        self.stuck_threshold_distance = 2.0  # meters - considered stuck if moved less than this
         self.stuck_time_threshold = 25.0  # seconds - stuck if not moved for this long
         self.stuck_check_position = None
         self.stuck_check_time = None
@@ -271,8 +271,8 @@ class RoverController(Node):
             self.change_exposure(self.current_exposure)
             
             # Print current exposure periodically (every 30 frames to reduce spam)
-            if self.rgb_frame_count % 30 == 0:
-                self.get_logger().info(f'Current exposure: {self.current_exposure:.3f}, Brightness: {brightness:.1f}')
+            # if self.rgb_frame_count % 30 == 0:
+            #     self.get_logger().info(f'Current exposure: {self.current_exposure:.3f}, Brightness: {brightness:.1f}')
             
             self.latest_rgb = cv_image
 
@@ -382,7 +382,7 @@ class RoverController(Node):
         # Calculate proportional steering based on rock positions
         # Rocks closer to center need more steering, rocks further away need less
         min_steer = 0.2  # Minimum steering to avoid
-        max_steer = 0.6  # Maximum steering (reduced from 0.8)
+        max_steer = 0.4  # Maximum steering (reduced from 0.8)
         
         if left_rocks and right_rocks:
             # Rocks on both sides - calculate average position and steer away from center
@@ -619,8 +619,8 @@ class RoverController(Node):
         # Step 6: Decide action
         if min_depth_overall < self.emergency_distance:
             # EMERGENCY STOP
-            self.obstacle_avoidance_active = True
-            self.emergency_stop_active = True
+            self.obstacle_avoidance_active = False
+            self.emergency_stop_active = False
             self.avoidance_steer_direction = 0.0  # No steering, just stop
             self.obstacle_clearance_time = None
             
@@ -660,7 +660,7 @@ class RoverController(Node):
                 # Steering: negative offset (left of center) -> steer right (positive)
                 #           positive offset (right of center) -> steer left (negative)
                 self.avoidance_steer_direction = -self.steering_gain * normalized_offset
-                self.obstacle_avoidance_active = True
+                self.obstacle_avoidance_active = False
                 self.obstacle_clearance_time = None
                 
                 if self.depth_frame_count % 10 == 0:
@@ -976,7 +976,7 @@ class RoverController(Node):
             turn_elapsed = elapsed - self.unstuck_reverse_duration
             self.send_reverse_command(0.0)  # Slight reverse while turning
             self.send_steer_command(-0.8)  # Turn left (negative = left)
-            self.send_accelerator_command(0.2)
+            self.send_accelerator_command(10.0)  # Slight forward to assist turn
             self.send_brake_command(0.0)
             if int(turn_elapsed * 2) % 2 == 0:  # Log every 0.5 seconds
                 self.get_logger().info(f"Recovery: Turning left... ({turn_elapsed:.1f}s)")
@@ -1066,24 +1066,32 @@ class RoverController(Node):
         # Velocity error - Dynamic speed based on YOLO detection, exposure, and waypoint proximity
         # Priority: exposure < 8 always uses speed 15, then waypoint proximity (except waypoints 12 & 19), then YOLO detection
         # Compute speed limit
-        if self.current_exposure < 8.0 and self.current_waypoint_idx not in [19]:
-            # Low exposure (dark conditions) - always reduce speed for safety
-            speed_limit_kph = 15.0
-        elif distance < 70.0 and self.current_waypoint_idx not in [12, 19]:
-            # Close to waypoint (< 70m) - reduce speed for precision approach
-            # Exception: waypoints 12 and 19 allow speed 20 even when close
-            speed_limit_kph = 15.0
-        elif len(self.rock_detections) > 0:
-            # Rocks currently detected - reduce speed
-            speed_limit_kph = 15.0
-        elif (self.last_rock_detection_time is not None and 
-              time.time() - self.last_rock_detection_time < self.speed_reduction_duration):
-            # Rocks were detected within last 2 seconds - keep speed reduced
-            speed_limit_kph = 15.0
-        else:
-            # No rocks detected and 2+ seconds have passed - can drive faster
-            # Waypoints 12 and 19 also allow speed 20 when close
+        # if self.current_exposure < 8.0 and self.current_waypoint_idx not in [18]:
+        #     # Low exposure (dark conditions) - always reduce speed for safety
+        #     speed_limit_kph = 17.0
+        # # elif distance < 100.0 and self.current_waypoint_idx in [3, 8]:
+        # #     # Approaching waypoint (< 100m) - moderate speed
+        # #     # Exception: waypoints 12 and 19 allow speed 20 even when close
+        # #     speed_limit_kph = 15.0
+        # elif distance < 50.0 and self.current_waypoint_idx not in [11, 18]:
+        #     # Close to waypoint (< 70m) - reduce speed for precision approach
+        #     # Exception: waypoints 12 and 19 allow speed 20 even when close
+        #     speed_limit_kph = 15.0
+        # elif len(self.rock_detections) > 0:
+        #     # Rocks currently detected - reduce speed
+        #     speed_limit_kph = 16.0
+        # elif (self.last_rock_detection_time is not None and 
+        #       time.time() - self.last_rock_detection_time < self.speed_reduction_duration):
+        #     # Rocks were detected within last 2 seconds - keep speed reduced
+        #     speed_limit_kph = 16.0
+        # else:
+        #     # No rocks detected and 2+ seconds have passed - can drive faster
+        #     # Waypoints 12 and 19 also allow speed 20 when close
+        #     speed_limit_kph = 25.0
+        if self.current_waypoint_idx in [1]:
             speed_limit_kph = 20.0
+        else:
+            speed_limit_kph = 25.0
 
         # Print/log only when speed changes
         if speed_limit_kph != self.last_speed_limit_kph:
